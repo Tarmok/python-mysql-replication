@@ -14,7 +14,7 @@ from .event import (
     QueryEvent, RotateEvent, FormatDescriptionEvent,
     XidEvent, GtidEvent, StopEvent,
     BeginLoadQueryEvent, ExecuteLoadQueryEvent,
-    HeartbeatLogEvent, NotImplementedEvent)
+    HeartbeatLogEvent, NotImplementedEvent, MariadbGtidEvent)
 from .exceptions import BinLogNotEnabled
 from .row_event import (
     UpdateRowsEvent, WriteRowsEvent, DeleteRowsEvent, TableMapEvent)
@@ -137,7 +137,8 @@ class BinLogStreamReader(object):
                  report_slave=None, slave_uuid=None,
                  pymysql_wrapper=None,
                  fail_on_table_metadata_unavailable=False,
-                 slave_heartbeat=None):
+                 slave_heartbeat=None,
+                 gtid=None, mariadb=False):
         """
         Attributes:
             ctl_connection_settings: Connection settings for cluster holding schema information
@@ -165,7 +166,12 @@ class BinLogStreamReader(object):
                              on replication resumption (in case many event to skip in
                              binlog). See MASTER_HEARTBEAT_PERIOD in mysql documentation
                              for semantics
+            mariadb: use MariaDB replication protocol
+            gtid: use mariadb gtid based replication, start stream from <gtid>
         """
+
+        self.__gtid = gtid
+        self.__mariadb = mariadb
 
         self.__connection_settings = connection_settings
         self.__connection_settings.setdefault("charset", "utf8")
@@ -282,6 +288,12 @@ class BinLogStreamReader(object):
             cur.execute("set @slave_uuid= '%s'" % self.slave_uuid)
             cur.close()
 
+        if self.__mariadb:
+            print "setting @mariadb_slave_capability=4"
+            cur = self._stream_connection.cursor()
+            cur.execute("SET @mariadb_slave_capability=4")
+            cur.close()
+
         if self.slave_heartbeat:
             # 4294967 is documented as the max value for heartbeats
             net_timeout = float(self.__connection_settings.get('read_timeout',
@@ -310,6 +322,20 @@ class BinLogStreamReader(object):
                 if master_status is None:
                     raise BinLogNotEnabled()
                 self.log_file, self.log_pos = master_status[:2]
+                cur.close()
+
+            if self.__mariadb:
+                # https://mariadb.com/kb/en/library/com_binlog_dump/
+                if self.__gtid:
+                    # If MariaDB gtid mode is select, clear log name and pos
+                    self.log_file = ""
+                    self.log_pos = 0
+                    cur = self._stream_connection.cursor()
+                    cur.execute("SET @slave_connect_state='%s'" % (self.__gtid))
+                    cur.close()
+                # set MariaDB slave_gtid_strict_mode to 1
+                cur = self._stream_connection.cursor()
+                cur.execute("SET @slave_gtid_strict_mode=1")
                 cur.close()
 
             prelude = struct.pack('<i', len(self.log_file) + 11) \
@@ -512,6 +538,7 @@ class BinLogStreamReader(object):
                 TableMapEvent,
                 HeartbeatLogEvent,
                 NotImplementedEvent,
+                MariadbGtidEvent
                 ))
         if ignored_events is not None:
             for e in ignored_events:
